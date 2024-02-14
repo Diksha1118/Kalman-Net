@@ -1,1 +1,152 @@
+##Vanilla Kalman Filter
+import torch
+from torch.utils.data import TensorDataset, DataLoader
+from torchvision.transforms import ToTensor
+from torch import nn
+import torch.nn.functional as F
+import os
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import scipy.stats
+from tqdm import tqdm
+import wandb
+import random
+from sklearn.model_selection import train_test_split
 
+df_regression = pd.read_csv("regression_dataset.csv")
+y = df_regression.iloc[:, :4].values  # States: Position and Velocity
+X = df_regression.iloc[:, 4:].values  # Observations: Channel Data
+
+# Split into training and test sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Convert to PyTorch tensors
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
+
+# Create data loaders
+train_data = TensorDataset(X_train_tensor, y_train_tensor)
+test_data = TensorDataset(X_test_tensor, y_test_tensor)
+train_loader = DataLoader(train_data, batch_size=64, shuffle=True)
+test_loader = DataLoader(test_data, batch_size=64, shuffle=False)
+
+#A: state model, AT: transpore of A
+#C:Observation model, CT: transpose of C
+#W: state noise covariance
+#Q: observation noise covariance
+
+
+def mse(y_true, y_pred): 
+    # Ensure y_true and y_pred are numpy arrays to simplify the calculation.
+    if isinstance(y_true, torch.Tensor):
+        y_true = y_true.numpy()
+    if isinstance(y_pred, torch.Tensor):
+        y_pred = y_pred.numpy()
+    # Compute MSE.
+    mse_x1 = np.mean((y_true[:,0] - y_pred[:,0]) ** 2)
+    mse_x2 = np.mean((y_true[:,1] - y_pred[:,1]) ** 2)
+    mse_x3 = np.mean((y_true[:,2] - y_pred[:,2]) ** 2)
+    mse_x4 = np.mean((y_true[:,3] - y_pred[:,3]) ** 2)
+    mse_final = np.array([mse_x1, mse_x2, mse_x3, mse_x4]) #combining into array
+    return mse_final
+
+def corr(y_true, y_pred):
+    # Ensure y_true and y_pred are numpy arrays.
+    if isinstance(y_true, torch.Tensor):
+        y_true = y_true.numpy()
+    if isinstance(y_pred, torch.Tensor):
+        y_pred = y_pred.numpy()
+    # Calculate Pearson correlation coefficient for each state variable.
+    corr_x1 = scipy.stats.pearsonr(y_true[:, 0], y_pred[:, 0])    
+    corr_x2 = scipy.stats.pearsonr(y_true[:, 1], y_pred[:, 1]) 
+    corr_x3 = scipy.stats.pearsonr(y_true[:, 2], y_pred[:, 2]) 
+    corr_x4 = scipy.stats.pearsonr(y_true[:, 3], y_pred[:, 3])
+    corr_final = np.array([corr_x1, corr_x2, corr_x3, corr_x4]) #combining into array 
+    return np.array(corr_final)
+
+class KalmanFilter():
+  def __init__(self, append_ones_y=True, device='cpu'):
+    self.A, self.C, self.W, self.Q = None, None, None, None # state model, obs model, state noise, obs noise
+    self.At, self.Ct = None, None # useful transposes
+    self.append_ones_y = append_ones_y
+    self.device = device
+
+  def train(self, x, y): # x is input matrix of observations, y is input matrix of ground truth state
+    if self.append_ones_y:
+      y = torch.cat((y, torch.ones([y.shape[0], 1])), dim=1) # pads y with an extra column of ones if needed
+    ytm = y[:-1, :] # all of y except the last row     (yt-1)prior state
+    yt = y[1:, :] # all of y except the first row
+
+    self.A = (yt.T @ ytm) @ torch.pinverse(ytm.T @ ytm) # calculates kinematic state model
+    self.W = (yt - (ytm @ self.A.T)).T @ (yt - (ytm @ self.A.T)) / (yt.shape[0] - 1) # covariance/noise for state model
+    self.C = (x.T @ y) @ torch.pinverse(y.T @ y) # calculates neural observation model
+    self.Q = (x - (y @ self.C.T)).T @ (x - (y @ self.C.T)) / yt.shape[0] # covariance/noise for obs model
+
+    self.At = self.A.T
+    self.Ct = self.C.T
+    
+  def __call__(self, x): # calls the model
+    return self.forward(x)
+  
+  def forward(self, x): # forward pass through the KF
+    y_pred = self.predict(x)
+    return y_pred
+  
+  def predict(self, x, start_y=None, return_tensor=True): # actual heavy lifting of the model run
+    x = x.view((x.shape[0], -1)) # reshapes x into a 2D tensor with the same number of rows
+    y_pred = torch.zeros((x.shape[0], self.A.shape[1])).double() # initializes the prediction matrix as 
+    # a tensor of zeros with the same number of rows as x and the same number of columns as A
+    # i.e. the same number of time steps as measurements and the same number of recordings as the state model
+    Pt = self.W.clone() # clone state error so we can update it in the for loop
+    if start_y:
+      y_pred[0,:] = start_y # initializes starting state if provided
+    
+    for t in tqdm(range(1, y_pred.shape[0])): # iterate through every timestep
+      yt = (y_pred[t-1, :]).float() @ self.At # predict new state based on last state prediction
+      Pt = self.A @ Pt @ self.At + self.W # error covariance
+      K = torch.linalg.lstsq((self.C @ Pt @ self.C.T + self.Q).T, (Pt @ self.C.T).T, rcond=None)[0].T # kalman gain calculation
+      y_pred[t, :] = yt.T + K @ (x[t, :].T - self.C @ yt.T) # state prediction
+      Pt =(torch.from_numpy(np.eye(Pt.shape[0])) - K @ self.C).float() @ Pt # update error covariance
+     
+    if not return_tensor:
+      y_pred = (y_pred).numpy()
+    return y_pred
+  
+# declare model
+kf = KalmanFilter(append_ones_y=False)
+kf.train(X_train_tensor, y_train_tensor)
+
+# predict
+kf_preds = kf.predict(X_test_tensor, return_tensor=False)
+
+
+# compute MSE between predictions and ground truth
+kf_mse = mse(y_test, kf_preds)
+print("Kalman Filter MSE Possition X :",kf_mse[0])
+print("Kalman Filter MSE Possition Y :",kf_mse[1])
+print("Kalman Filter MSE Velocity X :",kf_mse[2])
+print("Kalman Filter MSE Velocity Y :",kf_mse[3])
+# compute pearson correlation
+kf_corr = corr(y_test, kf_preds)
+
+print("Kalman Filter Correlation Possition X :",kf_corr[0])
+print("Kalman Filter Correlation Possition Y :",kf_corr[1])
+print("Kalman Filter Correlation Velocity X :",kf_corr[2])
+print("Kalman Filter Correlation Velocity Y :",kf_corr[3])
+
+def plot_all(truth, pred):
+  fig, axs = plt.subplots(2, 2)
+  axs = axs.flatten()
+  for i in range(4):
+    axs[i].plot(truth[:50, i], label=f'Ground truth')
+    axs[i].plot(pred[:50, i], label=f'Prediction')
+    axs[i].set_title(f'X_{i+1}')
+    axs[i].legend()
+  fig.suptitle(f"Ground Truth vs. Prediction for RNN")
+  plt.tight_layout()
+  plt.show()
+
+plot_all(y_test, kf_preds) 
