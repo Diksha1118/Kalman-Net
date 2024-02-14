@@ -1,1 +1,96 @@
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import pearsonr
 
+#X_1 for X pos and X_2 for Y pos
+#X_3 for velocity X pos, X_4 for velocity Y pos
+df_regression = pd.read_csv("regression_dataset.csv")
+y = df_regression.iloc[:, :4].values  # The first 4 columns are targets (position and velocity)
+X = df_regression.iloc[:, 4:].values  # The last 96 columns are channel data
+
+# Normalize features
+scaler = StandardScaler()
+X_normalized = scaler.fit_transform(X)
+# Split into training and test sets
+X_train, X_test, y_train, y_test = train_test_split(X_normalized, y, test_size=0.2, random_state=42)
+
+# Convert to PyTorch tensors
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
+X_train_tensor = X_train_tensor.unsqueeze(1) 
+X_test_tensor = X_test_tensor.unsqueeze(1)
+
+# Create data loaders
+train_data = TensorDataset(X_train_tensor, y_train_tensor)
+test_data = TensorDataset(X_test_tensor, y_test_tensor)
+train_loader = DataLoader(train_data, batch_size=64, shuffle=True)
+test_loader = DataLoader(test_data, batch_size=64, shuffle=False)
+
+class GRUNet(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(GRUNet, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        # Initializing hidden state for first input
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size)
+
+        # Forward propagate the GRU
+        out, _ = self.gru(x, h0)
+
+        # Pass the output of the last time step to the classifier
+        out = self.fc(out[:, -1, :])
+        return out
+
+# Initialize the GRU-based network
+input_size = 95  # Number of features (channels)
+hidden_size = 128  # Number of features in hidden state
+num_layers = 2  # Number of stacked GRU layers
+output_size = 4  # Number of output classes (X_1 through X_4)
+
+model = GRUNet(input_size, hidden_size, num_layers, output_size)
+
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+num_epochs = 100 
+
+# Training loop
+for epoch in range(num_epochs):
+    for i, (inputs, targets) in enumerate(train_loader):
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+# Evaluation
+model.eval()  # Set the model to evaluation mode
+total_mse = 0
+pearson_correlation = []
+
+with torch.no_grad():     #no gradient required in testing
+    for inputs, targets in test_loader:
+        outputs = model(inputs)
+        mse = criterion(outputs, targets).item() ##calls the criterion which calculates the loss btw outputs and targets
+        #.item(): converst the tensor to python scalar, hence he can have a num(eg: float)
+        total_mse += mse                          
+#converting tensors to numpy req by pearsonr: converts output and targets to numpy arrays
+    for output, target in zip(outputs, targets):
+        correlation, _ = pearsonr(output.numpy(), target.numpy())
+        pearson_correlation.append(correlation)    
+
+average_mse = total_mse / len(test_loader.dataset)
+average_pearson_correlation = sum(pearson_correlation) / len(pearson_correlation)
+
+print(f'Mean Square Error: {average_mse}')       
+print(f'Pearson Correlation: {average_pearson_correlation}')
